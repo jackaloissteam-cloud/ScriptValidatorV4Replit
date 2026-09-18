@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "ScriptValidatorV4"
+description = "A mobile-friendly script validation portal inspired by iPhone Notes, allowing users to add TXT files, read their contents, and validate scripts locally in the browser."
+version = "1.0.0"
+id = "artifacts/script-validator-v4"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 20859
+
+[services.development]
+run = "pnpm --filter @workspace/script-validator-v4 run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/script-validator-v4", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/script-validator-v4/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "20859"
+BASE_PATH = "/"
