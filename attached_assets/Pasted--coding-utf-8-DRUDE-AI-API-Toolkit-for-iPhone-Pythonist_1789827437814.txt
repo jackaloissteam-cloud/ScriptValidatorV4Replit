@@ -1,0 +1,358 @@
+# -*- coding: utf-8 -*-
+"""DRUDE AI API Toolkit for iPhone / Pythonista 3 - v2.2"""
+import json, os, threading, time, webbrowser
+from datetime import datetime
+import requests, ui, console
+try:
+    import keychain
+except ImportError:
+    keychain = None
+
+APP='DRUDE AI API Toolkit'; VER='2.2'; SERVICE='drude_ai_api_toolkit'; TIMEOUT=25
+BG='#0b0f16'; CARD='#151b26'; CARD2='#1c2432'; TEXT='#f4f7fb'; SUB='#9faabc'; ACC='#5b9cff'; GOOD='#4ed17f'; BAD='#ff6470'; WARN='#ffc857'; BORDER='#293245'
+
+PROVIDERS=[
+ ('huggingface','Hugging Face','🤗','hf_…','https://huggingface.co/settings/tokens'),
+ ('fal','fal.ai','⚡','fal API Key','https://fal.ai/dashboard/keys'),
+ ('replicate','Replicate','🧬','r8_…','https://replicate.com/account/api-tokens'),
+ ('openrouter','OpenRouter','🌐','sk-or-v1-…','https://openrouter.ai/settings/keys'),
+ ('together','Together AI','🔵','API Key','https://api.together.ai/settings/api-keys'),
+ ('fireworks','Fireworks AI','🔥','API Key','https://fireworks.ai/account/api-keys'),
+ ('groq','Groq','🚀','gsk_…','https://console.groq.com/keys'),
+ ('gemini','Google Gemini','✨','AIza…','https://aistudio.google.com/app/apikey'),
+ ('anthropic','Anthropic','🟣','sk-ant-…','https://console.anthropic.com/settings/keys'),
+ ('openai','OpenAI','⚫','sk-…','https://platform.openai.com/api-keys'),
+]
+PM={p[0]:p for p in PROVIDERS}
+
+def load_key(pid):
+    if keychain is None: return ''
+    try: return (keychain.get_password(SERVICE,SERVICE+'.'+pid) or '').strip()
+    except: return ''
+def save_key(pid,val):
+    if keychain is None: raise RuntimeError('Pythonista-Keychain nicht verfügbar.')
+    keychain.set_password(SERVICE,SERVICE+'.'+pid,val.strip())
+def del_key(pid):
+    try: keychain.delete_password(SERVICE,SERVICE+'.'+pid)
+    except: pass
+def mask(v): return 'nicht eingerichtet' if not v else (v[:5]+'••••••••'+v[-4:] if len(v)>10 else '••••••••')
+def detail(r):
+    try:
+        d=r.json()
+        if isinstance(d,dict):
+            for k in ('error','message','detail'):
+                if k in d:
+                    x=d[k]; return (x if isinstance(x,str) else json.dumps(x,ensure_ascii=False))[:220]
+        return json.dumps(d,ensure_ascii=False)[:220]
+    except: return (r.text or '')[:220]
+def OK(msg='Key akzeptiert',extra=None): return {'ok':True,'detail':msg,'extra':extra}
+def NO(msg): return {'ok':False,'detail':msg,'extra':None}
+
+def test_hf(k):
+    r=requests.get('https://huggingface.co/api/whoami-v2',headers={'Authorization':'Bearer '+k},timeout=TIMEOUT)
+    return OK('Benutzer: '+r.json().get('name','unbekannt'),r.json()) if r.status_code==200 else NO(f'HTTP {r.status_code}: {detail(r)}')
+def test_fal(k):
+    # v2.2 FAL KEYCHECK:
+    k=(k or '').strip()
+    if ':' not in k:
+        return NO(
+            'Unvollständiger fal.ai-Key: vermutlich nur die Key-ID. '
+            'Bitte einen neuen Key erstellen und den vollständigen Wert '
+            'key_id:key_secret direkt beim Erstellen kopieren.'
+        )
+    left,right=k.split(':',1)
+    if not left.strip() or len(right.strip()) < 8:
+        return NO('fal.ai-Key sieht unvollständig aus. Erwartet: key_id:key_secret.')
+
+    # v2.1 FAL PATCH:
+    # 1) Ein normaler API-scope Key wird zuerst über den Pricing-Endpunkt geprüft.
+    #    Dieser Aufruf erzeugt KEIN Bild und verursacht daher keine Inference-Kosten.
+    # 2) Erst wenn der Key gültig ist, versuchen wir zusätzlich Billing/Credits.
+    #    Billing benötigt bei fal.ai einen ADMIN-scope Key.
+    auth={'Authorization':'Key '+k,'Accept':'application/json'}
+
+    r=requests.get(
+        'https://api.fal.ai/v1/models/pricing',
+        headers=auth,
+        params={'endpoint_id':'fal-ai/flux/dev'},
+        timeout=TIMEOUT
+    )
+
+    if r.status_code!=200:
+        return NO(f'HTTP {r.status_code}: {detail(r)}')
+
+    pricing=r.json()
+
+    # Key ist ab hier sicher akzeptiert. Billing ist nur Bonusinformation.
+    try:
+        b=requests.get(
+            'https://api.fal.ai/v1/account/billing',
+            headers=auth,
+            params={'expand':'credits'},
+            timeout=TIMEOUT
+        )
+
+        if b.status_code==200:
+            d=b.json()
+            c=d.get('credits')
+            username=d.get('username')
+
+            msg='Key gültig'
+            if username:
+                msg += ' · '+str(username)
+
+            if isinstance(c,dict):
+                balance=c.get('current_balance', c.get('balance', c.get('amount')))
+                currency=c.get('currency','')
+                if balance is not None:
+                    msg += f' · Guthaben {balance} {currency}'.rstrip()
+
+            return OK(msg, {'pricing':pricing,'billing':d})
+
+        if b.status_code in (401,403):
+            return OK('Key gültig · API-Scope · Billing benötigt ADMIN-Key', pricing)
+
+        return OK(f'Key gültig · Billing HTTP {b.status_code}', pricing)
+
+    except Exception:
+        return OK('Key gültig · API-Scope', pricing)
+def test_replicate(k):
+    r=requests.get('https://api.replicate.com/v1/account',headers={'Authorization':'Bearer '+k},timeout=TIMEOUT)
+    return OK(str(r.json().get('username') or r.json().get('name') or 'Account erkannt'),r.json()) if r.status_code==200 else NO(f'HTTP {r.status_code}: {detail(r)}')
+def test_openrouter(k):
+    r=requests.get('https://openrouter.ai/api/v1/auth/key',headers={'Authorization':'Bearer '+k},timeout=TIMEOUT)
+    if r.status_code==200:
+        d=r.json(); x=d.get('data',{}); bits=[]
+        if isinstance(x,dict):
+            if x.get('label'): bits.append(str(x['label']))
+            if x.get('usage') is not None: bits.append('Usage '+str(x['usage']))
+            if x.get('limit') is not None: bits.append('Limit '+str(x['limit']))
+        return OK(' · '.join(bits) or 'Key akzeptiert',d)
+    return NO(f'HTTP {r.status_code}: {detail(r)}')
+def bearer_models(url,k):
+    r=requests.get(url,headers={'Authorization':'Bearer '+k},timeout=TIMEOUT)
+    if r.status_code!=200: return NO(f'HTTP {r.status_code}: {detail(r)}')
+    d=r.json(); n=len(d if isinstance(d,list) else d.get('data',[]) if isinstance(d,dict) else [])
+    return OK(f'Key akzeptiert · {n} Modelle sichtbar',d)
+def test_together(k): return bearer_models('https://api.together.xyz/v1/models',k)
+def test_fireworks(k): return bearer_models('https://api.fireworks.ai/inference/v1/models',k)
+def test_groq(k): return bearer_models('https://api.groq.com/openai/v1/models',k)
+def test_openai(k): return bearer_models('https://api.openai.com/v1/models',k)
+def test_gemini(k):
+    r=requests.get('https://generativelanguage.googleapis.com/v1beta/models',headers={'x-goog-api-key':k},params={'pageSize':1},timeout=TIMEOUT)
+    return OK('Key akzeptiert · Gemini API erreichbar',r.json()) if r.status_code==200 else NO(f'HTTP {r.status_code}: {detail(r)}')
+def test_anthropic(k):
+    r=requests.get('https://api.anthropic.com/v1/models',headers={'x-api-key':k,'anthropic-version':'2023-06-01'},params={'limit':1},timeout=TIMEOUT)
+    if r.status_code==200:
+        d=r.json(); a=d.get('data',[]); name=(a[0].get('display_name') or a[0].get('id')) if a else 'Modell verfügbar'; return OK('Key akzeptiert · '+str(name),d)
+    return NO(f'HTTP {r.status_code}: {detail(r)}')
+TEST={'huggingface':test_hf,'fal':test_fal,'replicate':test_replicate,'openrouter':test_openrouter,'together':test_together,'fireworks':test_fireworks,'groq':test_groq,'gemini':test_gemini,'anthropic':test_anthropic,'openai':test_openai}
+
+def label(txt='',font=('<System>',15),color=TEXT,align=ui.ALIGN_LEFT):
+    x=ui.Label(); x.text=txt; x.font=font; x.text_color=color; x.alignment=align; x.number_of_lines=0; return x
+def button(txt,act,bg=ACC,fg='white',font=('<System-Bold>',14)):
+    b=ui.Button(); b.title=txt; b.action=act; b.background_color=bg; b.tint_color=fg; b.font=font; b.corner_radius=12; return b
+
+class Card(ui.View):
+    def __init__(self,p,app):
+        super().__init__(); self.p=p; self.app=app; self.background_color=CARD; self.corner_radius=16; self.border_width=1; self.border_color=BORDER
+        self.ico=label(p[2],('<System>',25),align=ui.ALIGN_CENTER); self.n=label(p[1],('<System-Bold>',16)); self.s=label('',('<System>',12),SUB); self.k=label('',('<System>',10),SUB)
+        self.bt=button('TEST',self.dotest,CARD2,TEXT,('<System-Bold>',12)); self.bk=button('KEY',self.key,CARD2,TEXT,('<System-Bold>',12))
+        for x in (self.ico,self.n,self.s,self.k,self.bt,self.bk): self.add_subview(x)
+        self.local()
+    def layout(self):
+        w=self.width; self.ico.frame=(10,12,42,42); self.n.frame=(58,10,w-170,24); self.s.frame=(58,34,w-170,20); self.k.frame=(58,55,w-170,16); self.bt.frame=(w-104,10,92,28); self.bk.frame=(w-104,45,92,28)
+    def local(self):
+        k=load_key(self.p[0]); self.s.text='🟡 bereit zum Test' if k else '⚪ nicht eingerichtet'; self.s.text_color=WARN if k else SUB; self.k.text=mask(k) if k else ''
+    def testing(self): self.s.text='🔄 wird geprüft …'; self.s.text_color=WARN
+    def result(self,r): self.s.text=('🟢 ' if r['ok'] else '🔴 ')+r['detail']; self.s.text_color=GOOD if r['ok'] else BAD
+    def dotest(self,s): self.app.test_provider(self.p[0])
+    def key(self,s): self.app.edit_key(self.p[0])
+
+class App(ui.View):
+    def __init__(self):
+        super().__init__(); self.name=APP; self.background_color=BG; self.cards={}; self.scroll=ui.ScrollView(); self.scroll.background_color=BG; self.add_subview(self.scroll)
+        self.h=label('DRUDE AI API TOOLKIT',('<System-Bold>',24)); self.sh=label('iPhone Command Center · Keys · Spaces · Inference',('<System>',12),SUB)
+        self.all=button('⚡ ALLE KEYS TESTEN',self.test_all); self.hfl=button('🤗 HUGGING FACE LAB',self.open_hf,CARD2,TEXT); self.bill=button('💳 DASHBOARDS',self.dashboards,CARD2,TEXT); self.sec=label('API KEY CENTER',('<System-Bold>',13),SUB)
+        for x in (self.h,self.sh,self.all,self.hfl,self.bill,self.sec): self.scroll.add_subview(x)
+        for p in PROVIDERS:
+            c=Card(p,self); self.cards[p[0]]=c; self.scroll.add_subview(c)
+        self.foot=label('v'+VER+' · Keys nur im iOS-Keychain',('<System>',10),SUB,ui.ALIGN_CENTER); self.scroll.add_subview(self.foot)
+    def layout(self):
+        self.scroll.frame=self.bounds; pad=14; w=self.width-pad*2; self.h.frame=(pad,16,w,34); self.sh.frame=(pad,48,w,28); self.all.frame=(pad,82,w,46); half=(w-8)/2; self.hfl.frame=(pad,138,half,42); self.bill.frame=(pad+half+8,138,half,42); self.sec.frame=(pad,196,w,24); y=225
+        for p in PROVIDERS: self.cards[p[0]].frame=(pad,y,w,84); y+=93
+        self.foot.frame=(pad,y+4,w,28); self.scroll.content_size=(self.width,y+45)
+    def edit_key(self,pid):
+        p=PM[pid]; cur=load_key(pid); ch=console.alert(p[2]+' '+p[1],'Gespeichert: '+mask(cur),'Key eingeben','Key löschen','Dashboard')
+        if ch==1:
+            try: v=console.input_alert(p[1],'API-Key eingeben ('+p[3]+'):', '', 'Speichern').strip()
+            except KeyboardInterrupt: return
+            if v:
+                if pid=='fal' and ':' not in v:
+                    console.alert(
+                        'fal.ai-Key unvollständig',
+                        'Das sieht nur nach der Key-ID aus.\n\n'
+                        'fal.ai benötigt den vollständigen Wert:\n'
+                        'key_id:key_secret\n\n'
+                        'Erstelle einen neuen Key und kopiere ihn direkt beim Erstellen vollständig.',
+                        'OK',
+                        hide_cancel_button=True
+                    )
+                    return
+                save_key(pid,v); self.cards[pid].local(); self.test_provider(pid)
+        elif ch==2 and cur:
+            if console.alert('Key löschen?',p[1]+' aus dem iOS-Keychain entfernen?','Löschen','Abbrechen')==1: del_key(pid); self.cards[pid].local()
+        elif ch==3: webbrowser.open(p[4])
+    def test_provider(self,pid):
+        k=load_key(pid)
+        if not k: self.edit_key(pid); return
+        self.cards[pid].testing()
+        def run():
+            try: r=TEST[pid](k)
+            except requests.exceptions.Timeout: r=NO('Zeitüberschreitung')
+            except Exception as e: r=NO(str(e))
+            ui.delay(lambda:self.cards[pid].result(r),.05)
+        threading.Thread(target=run,daemon=True).start()
+    def test_all(self,s):
+        ids=[p[0] for p in PROVIDERS if load_key(p[0])]
+        if not ids: console.alert('Noch keine Keys','Bei einem Anbieter auf KEY tippen.','OK',hide_cancel_button=True); return
+        s.enabled=False; s.title='🔄 TEST LÄUFT …'
+        for pid in ids:self.cards[pid].testing()
+        def run():
+            good=bad=0
+            for pid in ids:
+                try:r=TEST[pid](load_key(pid))
+                except Exception as e:r=NO(str(e))
+                if r['ok']:good+=1
+                else:bad+=1
+                ui.delay(lambda pid=pid,r=r:self.cards[pid].result(r),.05)
+            def done(): s.enabled=True; s.title='⚡ ALLE KEYS TESTEN'; console.alert('Test abgeschlossen',f'🟢 OK: {good}\n🔴 Fehler: {bad}','OK',hide_cancel_button=True)
+            ui.delay(done,.15)
+        threading.Thread(target=run,daemon=True).start()
+    def open_hf(self,s): HFLab().present('sheet')
+    def dashboards(self,s): Dash().present('sheet')
+
+class Dash(ui.View):
+    def __init__(self):
+        super().__init__(); self.name='Dashboards'; self.background_color=BG; self.sc=ui.ScrollView(frame=self.bounds,flex='WH'); self.add_subview(self.sc); self.bs=[]; y=16
+        for p in PROVIDERS:
+            b=button(p[2]+'  '+p[1],lambda s,url=p[4]:webbrowser.open(url),CARD,TEXT); b.frame=(16,y,340,46); b.flex='W'; self.sc.add_subview(b); self.bs.append(b); y+=56
+        self.sc.content_size=(0,y+20)
+    def layout(self):
+        for b in self.bs:b.width=self.width-32
+
+def hfkey():
+    k=load_key('huggingface')
+    if not k: console.alert('HF Token fehlt','Im Hauptfenster bei Hugging Face auf KEY tippen.','OK',hide_cancel_button=True)
+    return k
+
+class HFLab(ui.View):
+    def __init__(self):
+        super().__init__(); self.name='Hugging Face Lab'; self.background_color=BG; self.t=label('🤗 HUGGING FACE LAB',('<System-Bold>',23)); self.st=label('Modelle · Spaces · Chat · Bildgenerator',('<System>',12),SUB); self.add_subview(self.t); self.add_subview(self.st)
+        self.bs=[button('🤖 MODELLE SUCHEN',self.models,CARD,TEXT),button('📂 EIGENE SPACES',self.spaces,CARD,TEXT),button('🚀 SPACE STATUS / RESTART',self.space,CARD,TEXT),button('💬 CHAT INFERENCE TEST',self.chat,CARD,TEXT),button('🖼️ BILDGENERATOR TEST',self.image,CARD,TEXT),button('💳 HF BILLING ÖFFNEN',lambda s:webbrowser.open('https://huggingface.co/settings/billing'),CARD,TEXT)]
+        for b in self.bs:self.add_subview(b)
+    def layout(self):
+        p=18; w=self.width-36; self.t.frame=(p,20,w,34); self.st.frame=(p,54,w,25); y=96
+        for b in self.bs:b.frame=(p,y,w,50); y+=62
+    def models(self,s):
+        try:q=console.input_alert('HF Modell-Suche','Suchbegriff:','text-to-image','Suchen').strip()
+        except:return
+        if not q:return
+        def run():
+            try:
+                k=load_key('huggingface'); h={'Authorization':'Bearer '+k} if k else {}; r=requests.get('https://huggingface.co/api/models',params={'search':q,'limit':30,'sort':'downloads','direction':-1,'full':'true'},headers=h,timeout=TIMEOUT)
+                if r.status_code!=200:raise RuntimeError(f'HTTP {r.status_code}: {detail(r)}')
+                ui.delay(lambda:Results(r.json(),q).present('sheet'),.05)
+            except Exception as e: ui.delay(lambda:console.alert('Fehler',str(e),'OK',hide_cancel_button=True),.05)
+        threading.Thread(target=run,daemon=True).start()
+    def spaces(self,s):
+        k=hfkey();
+        if not k:return
+        def run():
+            try:
+                me=test_hf(k); user=me['extra']['name']; r=requests.get('https://huggingface.co/api/spaces',params={'author':user,'limit':100,'sort':'lastModified','direction':-1,'full':'true'},headers={'Authorization':'Bearer '+k},timeout=TIMEOUT)
+                if r.status_code!=200:raise RuntimeError(f'HTTP {r.status_code}: {detail(r)}')
+                ui.delay(lambda:Spaces(r.json()).present('sheet'),.05)
+            except Exception as e:ui.delay(lambda:console.alert('Fehler',str(e),'OK',hide_cancel_button=True),.05)
+        threading.Thread(target=run,daemon=True).start()
+    def space(self,s):
+        k=hfkey();
+        if not k:return
+        try:sid=console.input_alert('Space','Space-ID Benutzer/Space:','','Prüfen').strip()
+        except:return
+        if sid:runtime(sid,k)
+    def chat(self,s):
+        k=hfkey();
+        if not k:return
+        try:m=console.input_alert('HF Chat-Modell','Model-ID:','Qwen/Qwen2.5-7B-Instruct','Weiter').strip(); q=console.input_alert('Prompt','Nachricht:','Antworte auf Deutsch: Was ist Hugging Face in drei Sätzen?','Senden').strip()
+        except:return
+        if not m or not q:return
+        s.enabled=False; old=s.title; s.title='🔄 INFERENCE …'
+        def run():
+            try:
+                r=requests.post('https://router.huggingface.co/v1/chat/completions',headers={'Authorization':'Bearer '+k,'Content-Type':'application/json'},json={'model':m,'messages':[{'role':'user','content':q}],'max_tokens':400,'stream':False},timeout=120)
+                if r.status_code!=200:raise RuntimeError(f'HTTP {r.status_code}: {detail(r)}')
+                txt=r.json()['choices'][0]['message']['content']; ui.delay(lambda:TextView('HF Chat Antwort',txt).present('sheet'),.05)
+            except Exception as e:ui.delay(lambda:console.alert('Inference Fehler',str(e),'OK',hide_cancel_button=True),.05)
+            finally:ui.delay(lambda:(setattr(s,'enabled',True),setattr(s,'title',old)),.1)
+        threading.Thread(target=run,daemon=True).start()
+    def image(self,s):
+        k=hfkey();
+        if not k:return
+        try:m=console.input_alert('HF Bildmodell','Model-ID:','black-forest-labs/FLUX.1-schnell','Weiter').strip(); q=console.input_alert('Bild-Prompt','Motiv:','A cinematic vintage propeller aircraft above the Rhine at sunset','Generieren').strip()
+        except:return
+        if not m or not q:return
+        s.enabled=False; old=s.title; s.title='🔄 BILD …'
+        def run():
+            try:
+                r=requests.post('https://router.huggingface.co/hf-inference/models/'+m,headers={'Authorization':'Bearer '+k,'Accept':'image/png,image/jpeg,application/json','Content-Type':'application/json'},json={'inputs':q},timeout=180)
+                if r.status_code!=200:raise RuntimeError(f'HTTP {r.status_code}: {detail(r)}')
+                ct=r.headers.get('content-type','').lower();
+                if 'image' not in ct:raise RuntimeError('API lieferte kein Bild.')
+                ext='.png' if 'png' in ct else '.jpg'; fn='HF_Image_'+datetime.now().strftime('%Y%m%d_%H%M%S')+ext; path=os.path.join(os.path.expanduser('~/Documents'),fn); open(path,'wb').write(r.content)
+                ui.delay(lambda:console.quicklook(path),.2)
+            except Exception as e:ui.delay(lambda:console.alert('Bild-Fehler',str(e),'OK',hide_cancel_button=True),.05)
+            finally:ui.delay(lambda:(setattr(s,'enabled',True),setattr(s,'title',old)),.1)
+        threading.Thread(target=run,daemon=True).start()
+
+class Results(ui.View):
+    def __init__(self,models,q):
+        super().__init__(); self.name='Modelle: '+q; self.background_color=BG; self.models=models; self.table=ui.TableView(frame=self.bounds,flex='WH'); rows=[]
+        for m in models:
+            mid=m.get('id') or m.get('modelId') or '?'; rows.append({'title':mid,'subtitle':f"{m.get('pipeline_tag') or 'ohne Aufgabe'} · ↓ {m.get('downloads',0):,} · ♥ {m.get('likes',0)}"})
+        self.ds=ui.ListDataSource(rows); self.ds.action=self.tap; self.table.data_source=self.ds; self.table.delegate=self.ds; self.add_subview(self.table)
+    def tap(self,s):
+        i=s.selected_row
+        if 0<=i<len(self.models):webbrowser.open('https://huggingface.co/'+(self.models[i].get('id') or self.models[i].get('modelId')))
+class Spaces(ui.View):
+    def __init__(self,spaces):
+        super().__init__(); self.name='Eigene Spaces'; self.spaces=spaces; self.table=ui.TableView(frame=self.bounds,flex='WH'); rows=[{'title':x.get('id','?'),'subtitle':f"{x.get('sdk') or '?'} · {'privat' if x.get('private') else 'öffentlich'} · ♥ {x.get('likes',0)}"} for x in spaces]; self.ds=ui.ListDataSource(rows); self.ds.action=self.tap; self.table.data_source=self.ds; self.table.delegate=self.ds; self.add_subview(self.table)
+    def tap(self,s):
+        i=s.selected_row
+        if not(0<=i<len(self.spaces)):return
+        sid=self.spaces[i].get('id'); c=console.alert(sid,'Aktion:','Status','Browser','Restart'); k=load_key('huggingface')
+        if c==1:runtime(sid,k)
+        elif c==2:webbrowser.open('https://huggingface.co/spaces/'+sid)
+        elif c==3:restart(sid,k)
+def runtime(sid,k):
+    def run():
+        try:
+            r=requests.get('https://huggingface.co/api/spaces/'+sid+'/runtime',headers={'Authorization':'Bearer '+k},timeout=TIMEOUT)
+            if r.status_code!=200:raise RuntimeError(f'HTTP {r.status_code}: {detail(r)}')
+            d=r.json(); txt=f"Space: {sid}\n\nStatus: {d.get('stage','?')}\nCurrent Hardware: {d.get('currentHardware','?')}\nRequested Hardware: {d.get('requestedHardware','?')}\nSleep Time: {d.get('sleepTime','?')}"; ui.delay(lambda:console.alert('Space Status',txt,'OK',hide_cancel_button=True),.05)
+        except Exception as e:ui.delay(lambda:console.alert('Space Fehler',str(e),'OK',hide_cancel_button=True),.05)
+    threading.Thread(target=run,daemon=True).start()
+def restart(sid,k):
+    if console.alert('Space neu starten?',sid,'Restart','Abbrechen')!=1:return
+    def run():
+        try:
+            r=requests.post('https://huggingface.co/api/spaces/'+sid+'/restart',headers={'Authorization':'Bearer '+k},timeout=TIMEOUT)
+            if r.status_code not in (200,202):raise RuntimeError(f'HTTP {r.status_code}: {detail(r)}')
+            ui.delay(lambda:console.alert('Restart ausgelöst','Der Space wird neu gestartet.','OK',hide_cancel_button=True),.05)
+        except Exception as e:ui.delay(lambda:console.alert('Restart Fehler',str(e),'OK',hide_cancel_button=True),.05)
+    threading.Thread(target=run,daemon=True).start()
+class TextView(ui.View):
+    def __init__(self,title,text):
+        super().__init__(); self.name=title; self.background_color=BG; t=ui.TextView(frame=self.bounds,flex='WH'); t.background_color=CARD; t.text_color=TEXT; t.font=('<System>',15); t.text=text; t.editable=False; self.add_subview(t)
+
+if __name__=='__main__': App().present('fullscreen',hide_title_bar=True)
